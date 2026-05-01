@@ -1,21 +1,22 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use output::Report;
-use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::ffi::{CString, OsString};
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+mod cgroup;
 mod output;
 mod proc_status;
 mod rusage;
-mod cgroup;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -88,38 +89,15 @@ fn run() -> Result<()> {
         .split_first()
         .context("missing command after '--'")?;
 
-    let mut child_cmd = Command::new(program);
-    child_cmd.args(program_args);
-    if let Some(cwd) = &args.cwd {
-        child_cmd.current_dir(cwd);
-    }
-    if args.clear_env {
-        child_cmd.env_clear();
-    }
-    for entry in &args.env_vars {
-        let (key, value) = parse_env_assignment(entry)?;
-        child_cmd.env(key, value);
-    }
-    if let Some(path) = &args.child_stdout {
-        child_cmd.stdout(open_stdio_file(path)?);
-    }
-    if let Some(path) = &args.child_stderr {
-        child_cmd.stderr(open_stdio_file(path)?);
-    }
-    let child = child_cmd.spawn().with_context(|| {
-        format!(
-            "failed to spawn command {:?}",
-            command.first().cloned().unwrap_or_default()
-        )
-    })?;
-    let cgroup_setup = cgroup::CgroupMemorySession::attach_child_with_reason(child.id());
+    let child_pid = spawn_child(&args, program, program_args, &command)?;
+    let cgroup_setup = cgroup::CgroupMemorySession::attach_child_with_reason(child_pid);
     let measurement_started = if args.announce_child_pid_file.is_some() {
-        stop_child(child.id())?;
+        wait_for_child_stop(child_pid, Duration::from_secs(1))?;
         write_child_pid_file(
             args.announce_child_pid_file
                 .as_ref()
                 .context("missing child pid file path")?,
-            child.id(),
+            child_pid,
         )?;
         wait_for_file(
             args.await_profiler_file
@@ -127,7 +105,7 @@ fn run() -> Result<()> {
                 .context("missing profiler release path")?,
             Duration::from_secs(30),
         )?;
-        continue_child(child.id())?;
+        continue_child(child_pid)?;
         Instant::now()
     } else {
         Instant::now()
@@ -138,7 +116,7 @@ fn run() -> Result<()> {
     let sampler = sampler_interval_ms
         .map(|interval_ms| {
             proc_status::ProcStatusSampler::start(
-                child.id(),
+                child_pid,
                 interval_ms,
                 args.sample_proc_status_out.clone(),
             )
@@ -146,8 +124,8 @@ fn run() -> Result<()> {
         .transpose()?;
     let timeout_watch = args
         .child_timeout_seconds
-        .map(|seconds| start_child_timeout_watch(child.id(), Duration::from_secs(seconds)));
-    let outcome = rusage::wait4(child.id()).context("failed while waiting for child process")?;
+        .map(|seconds| start_child_timeout_watch(child_pid, Duration::from_secs(seconds)));
+    let outcome = rusage::wait4(child_pid).context("failed while waiting for child process")?;
     let mut child_cgroup_memory = None;
     let mut child_cgroup_memory_status = cgroup_setup.status;
     if let Some(session) = cgroup_setup.session {
@@ -197,14 +175,8 @@ fn run() -> Result<()> {
         child_cgroup_memory,
         child_cgroup_memory_status,
         objects_processed: args.objects_processed,
-        objects_per_second: throughput_metrics(
-            args.objects_processed,
-            elapsed_s,
-        ),
-        seconds_per_object: elapsed_per_object(
-            args.objects_processed,
-            elapsed_s,
-        ),
+        objects_per_second: throughput_metrics(args.objects_processed, elapsed_s),
+        seconds_per_object: elapsed_per_object(args.objects_processed, elapsed_s),
     };
 
     match args.format {
@@ -274,7 +246,170 @@ fn elapsed_per_object(objects_processed: Option<u64>, elapsed_s: f64) -> Option<
     })
 }
 
+fn spawn_child(
+    args: &Args,
+    program: &OsString,
+    program_args: &[OsString],
+    command: &[String],
+) -> Result<u32> {
+    if args.announce_child_pid_file.is_some() {
+        spawn_child_for_profiler_attach(args, program, program_args)
+    } else {
+        spawn_child_with_command(args, program, program_args, command)
+    }
+}
+
+fn spawn_child_with_command(
+    args: &Args,
+    program: &OsString,
+    program_args: &[OsString],
+    command: &[String],
+) -> Result<u32> {
+    let mut child_cmd = Command::new(program);
+    child_cmd.args(program_args);
+    if let Some(cwd) = &args.cwd {
+        child_cmd.current_dir(cwd);
+    }
+    if args.clear_env {
+        child_cmd.env_clear();
+    }
+    for entry in &args.env_vars {
+        let (key, value) = parse_env_assignment(entry)?;
+        child_cmd.env(key, value);
+    }
+    if let Some(path) = &args.child_stdout {
+        child_cmd.stdout(open_stdio_file(path)?);
+    }
+    if let Some(path) = &args.child_stderr {
+        child_cmd.stderr(open_stdio_file(path)?);
+    }
+    let child = child_cmd.spawn().with_context(|| {
+        format!(
+            "failed to spawn command {:?}",
+            command.first().cloned().unwrap_or_default()
+        )
+    })?;
+    Ok(child.id())
+}
+
+fn spawn_child_for_profiler_attach(
+    args: &Args,
+    program: &OsString,
+    program_args: &[OsString],
+) -> Result<u32> {
+    let stdout_file = args
+        .child_stdout
+        .as_ref()
+        .map(open_child_output_file)
+        .transpose()?;
+    let stderr_file = args
+        .child_stderr
+        .as_ref()
+        .map(open_child_output_file)
+        .transpose()?;
+    let cwd = args.cwd.as_ref().map(path_to_cstring).transpose()?;
+    let env_pairs = args
+        .env_vars
+        .iter()
+        .map(|entry| {
+            let (key, value) = parse_env_assignment(entry)?;
+            Ok((cstring_from_bytes(key.as_bytes())?, cstring_from_bytes(value.as_bytes())?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let argv = build_exec_argv(program, program_args)?;
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to fork child process");
+    }
+    if pid == 0 {
+        child_exec_for_profiler_attach(args.clear_env, cwd, env_pairs, stdout_file, stderr_file, argv);
+    }
+    Ok(pid as u32)
+}
+
+fn child_exec_for_profiler_attach(
+    clear_env: bool,
+    cwd: Option<CString>,
+    env_pairs: Vec<(CString, CString)>,
+    stdout_file: Option<File>,
+    stderr_file: Option<File>,
+    argv: Vec<CString>,
+) -> ! {
+    if redirect_child_fd(stdout_file.as_ref(), libc::STDOUT_FILENO).is_err() {
+        child_fatal_exit(b"memory-harness: failed to redirect child stdout\n");
+    }
+    if redirect_child_fd(stderr_file.as_ref(), libc::STDERR_FILENO).is_err() {
+        child_fatal_exit(b"memory-harness: failed to redirect child stderr\n");
+    }
+    if let Some(cwd) = cwd.as_ref() {
+        let rc = unsafe { libc::chdir(cwd.as_ptr()) };
+        if rc != 0 {
+            child_fatal_exit(b"memory-harness: failed to change child cwd\n");
+        }
+    }
+    if clear_env {
+        let rc = unsafe { libc::clearenv() };
+        if rc != 0 {
+            child_fatal_exit(b"memory-harness: failed to clear child environment\n");
+        }
+    }
+    for (key, value) in &env_pairs {
+        let rc = unsafe { libc::setenv(key.as_ptr(), value.as_ptr(), 1) };
+        if rc != 0 {
+            child_fatal_exit(b"memory-harness: failed to set child environment\n");
+        }
+    }
+    let rc = unsafe { libc::raise(libc::SIGSTOP) };
+    if rc != 0 {
+        child_fatal_exit(b"memory-harness: failed to stop child before profiler attach\n");
+    }
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    unsafe {
+        libc::execvp(argv[0].as_ptr(), argv_ptrs.as_ptr());
+    }
+    child_fatal_exit(b"memory-harness: failed to exec child command\n");
+}
+
+fn redirect_child_fd(file: Option<&File>, target_fd: libc::c_int) -> Result<()> {
+    if let Some(file) = file {
+        let rc = unsafe { libc::dup2(file.as_raw_fd(), target_fd) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("dup2 failed");
+        }
+    }
+    Ok(())
+}
+
+fn child_fatal_exit(message: &[u8]) -> ! {
+    let _ = unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
+    unsafe { libc::_exit(127) }
+}
+
+fn build_exec_argv(program: &OsString, program_args: &[OsString]) -> Result<Vec<CString>> {
+    let mut argv = Vec::with_capacity(program_args.len() + 1);
+    argv.push(cstring_from_bytes(program.as_os_str().as_bytes())?);
+    for arg in program_args {
+        argv.push(cstring_from_bytes(arg.as_os_str().as_bytes())?);
+    }
+    Ok(argv)
+}
+
+fn path_to_cstring(path: &PathBuf) -> Result<CString> {
+    cstring_from_bytes(path.as_os_str().as_bytes())
+}
+
+fn cstring_from_bytes(bytes: &[u8]) -> Result<CString> {
+    CString::new(bytes).map_err(|_| anyhow!("argument contains an interior NUL byte"))
+}
+
 fn open_stdio_file(path: &PathBuf) -> Result<Stdio> {
+    let file = open_child_output_file(path)?;
+    Ok(Stdio::from(file))
+}
+
+fn open_child_output_file(path: &PathBuf) -> Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -283,12 +418,11 @@ fn open_stdio_file(path: &PathBuf) -> Result<Stdio> {
             )
         })?;
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("failed to open child stdio file {}", path.display()))?;
-    Ok(Stdio::from(file))
+        .with_context(|| format!("failed to open child stdio file {}", path.display()))
 }
 
 fn validate_profiler_sync_args(args: &Args) -> Result<()> {
@@ -323,13 +457,58 @@ fn wait_for_file(path: &PathBuf, timeout: Duration) -> Result<()> {
     )
 }
 
-fn stop_child(pid: u32) -> Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to stop child for profiler attach");
+fn wait_for_child_stop(pid: u32, timeout: Duration) -> Result<()> {
+    let proc_status_path = PathBuf::from(format!("/proc/{pid}/status"));
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        match std::fs::read_to_string(&proc_status_path) {
+            Ok(status) => match child_state_code(&status) {
+                Some("T" | "t") => return Ok(()),
+                Some("Z" | "X" | "x") => {
+                    bail!("child exited before profiler attach completed");
+                }
+                _ => {}
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                bail!("child exited before profiler attach completed");
+            }
+            Err(err) => {
+                return Err(err).context("failed to inspect child state for profiler attach");
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
     }
-    Ok(())
+    bail!("timed out waiting for child to reach stopped state for profiler attach")
+}
+
+fn child_is_stopped(proc_status: &str) -> bool {
+    matches!(child_state_code(proc_status), Some("T" | "t"))
+}
+
+fn child_state_code(proc_status: &str) -> Option<&str> {
+    proc_status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .and_then(|state| state.split_whitespace().next())
+}
+
+#[cfg(test)]
+mod profiler_sync_tests {
+    use super::{child_is_stopped, child_state_code};
+
+    #[test]
+    fn child_is_stopped_detects_linux_stop_states() {
+        assert!(child_is_stopped("Name:\ttest\nState:\tT (stopped)\n"));
+        assert!(child_is_stopped("Name:\ttest\nState:\tt (tracing stop)\n"));
+        assert!(!child_is_stopped("Name:\ttest\nState:\tS (sleeping)\n"));
+    }
+
+    #[test]
+    fn child_state_code_reads_linux_proc_status() {
+        assert_eq!(child_state_code("Name:\ttest\nState:\tT (stopped)\n"), Some("T"));
+        assert_eq!(child_state_code("Name:\ttest\nState:\tZ (zombie)\n"), Some("Z"));
+        assert_eq!(child_state_code("Name:\ttest\nThreads:\t1\n"), None);
+    }
 }
 
 fn continue_child(pid: u32) -> Result<()> {

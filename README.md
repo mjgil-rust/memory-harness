@@ -238,6 +238,10 @@ instead of blind settle sleeps and signal-based shutdown:
 - when the run ends, the wrapper sends `stop` and waits for `ack` before
   collecting `perf report`
 
+When `--perf-stat` is enabled, the wrapper now attaches `perf stat` to that
+same child PID during the same run instead of executing the command again after
+the profile is already finished.
+
 For direct harness-only memory and resource accounting:
 
 ```bash

@@ -117,7 +117,8 @@ When cgroup accounting is active, the harness emits `child_cgroup_memory` with
 ## Perf Boundary
 
 The default repo workflow is now a synchronized concurrent wrapper run:
-`memory-harness` forks the target command, stops it immediately after spawn,
+`memory-harness` forks the target command, the child self-stops in `pre_exec`,
+the parent waits until `/proc/<pid>/status` reports the stopped state,
 announces the child PID, and the wrapper attaches `perf` directly to that child
 before releasing it.
 
@@ -127,7 +128,7 @@ That gives one timestamped artifact bundle containing:
 - proc-status samples
 - `perf.data`
 - text `perf report`
-- optional `perf stat`
+- optional attached `perf stat`
 - a combined child-output and profiler log
 
 That removes the harness parent wait/report path from the main sampled CPU
@@ -143,6 +144,10 @@ with named FIFOs to make both startup and shutdown explicit:
 - the wrapper sends `enable` and waits for `ack`
 - only then does the harness continue the child
 - when the run is over, the wrapper sends `stop` and waits for `ack`
+
+When `--perf-stat` is enabled, the wrapper also attaches `perf stat` to the
+same announced child PID for the same run instead of launching a second pass
+after the profiled command completes.
 
 This removes the fixed "settle sleep" from the main path and avoids relying on
 signal delivery for normal `perf` finalization.
@@ -164,8 +169,8 @@ Concurrent wrapper mode:
 - `scripts/run-with-memory-and-perf.sh --timeout-seconds N -- ...`
 - the wrapper owns the deadline so it can ask `perf` to stop before terminating
   the child
-- at the deadline the wrapper writes a timeout marker, best-effort sends `stop`
-  to `perf`, and then terminates the child
+- at the deadline the wrapper writes a timeout marker, asks the attached
+  profilers to stop or disable collection, and only then terminates the child
 - `memory-harness` sees the timeout marker via `--timeout-marker-file` and marks
   the JSON result as `timed_out=true` even though the wrapper owned the clock
 

@@ -18,8 +18,13 @@ Environment:
 EOF
 }
 
+perf_tool_supports_control() {
+    local subcommand="$1"
+    { perf "$subcommand" -h 2>&1 || true; } | grep -q -- '--control'
+}
+
 perf_record_supports_control() {
-    { perf record -h 2>&1 || true; } | grep -q -- '--control'
+    perf_tool_supports_control record
 }
 
 perf_send_control() {
@@ -31,10 +36,7 @@ perf_send_control() {
 
     timeout "$timeout_s" bash -lc 'printf "%s\n" "$1" > "$2"' _ "$control_cmd" "$ctl_fifo"
     ack_line="$(timeout "$timeout_s" bash -lc 'IFS= read -r line < "$1"; printf "%s" "$line"' _ "$ack_fifo")"
-    if [[ "$ack_line" != "ack" ]]; then
-        printf 'unexpected perf control ack for %s: %s\n' "$control_cmd" "${ack_line:-<none>}" >&2
-        return 1
-    fi
+    [[ "$ack_line" == "ack" ]]
 }
 
 wait_for_perf_ready() {
@@ -66,6 +68,20 @@ wait_for_log_line() {
             return 0
         fi
         sleep 0.01
+    done
+    return 1
+}
+
+wait_for_process_exit() {
+    local pid="$1"
+    local attempts="${2:-100}"
+    local sleep_s="${3:-0.05}"
+
+    for _ in $(seq 1 "$attempts"); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep "$sleep_s"
     done
     return 1
 }
@@ -152,12 +168,15 @@ run_once() {
     local child_pid=""
     local perf_record_pid=0
     local perf_record_forced_stop=0
+    local perf_stat_pid=0
+    local perf_stat_forced_stop=0
     local perf_control_mode="signal"
     local timeout_triggered=0
     local timeout_deadline_ms=0
     local memory_status_for_return=0
     local perf_record_status_for_return=0
     local perf_stat_status_for_return=0
+    local perf_needs_settle_sleep=0
     local -a harness_timeout_args=()
 
     mkdir -p "$run_dir"
@@ -228,6 +247,15 @@ run_once() {
     fi
     perf_record_pid=$!
     set -e
+    if [[ "$with_perf_stat" -eq 1 ]]; then
+        printf 'attaching perf stat to child pid %s\n' "$child_pid" >&2
+        set +e
+        perf stat \
+            -o "$perf_stat" \
+            -p "$child_pid" >>"$combined_log" 2>&1 &
+        perf_stat_pid=$!
+        set -e
+    fi
     if [[ "$perf_control_mode" == "control" ]]; then
         if ! wait_for_perf_ready "$perf_record_pid" "$perf_data" || \
             ! {
@@ -235,12 +263,23 @@ run_once() {
                     wait_for_log_line "$combined_log" "Events enabled"
             }
         then
+            printf 'failed to enable perf recording before child release\n' >&2
             kill "$harness_pid" 2>/dev/null || true
             wait "$harness_pid" 2>/dev/null || true
+            if [[ "$perf_stat_pid" -ne 0 ]]; then
+                force_stop_perf_process "$perf_stat_pid"
+                wait "$perf_stat_pid" 2>/dev/null || true
+            fi
             rm -f "$perf_ctl_fifo" "$perf_ack_fifo"
             return 1
         fi
     else
+        perf_needs_settle_sleep=1
+    fi
+    if [[ "$perf_stat_pid" -ne 0 ]]; then
+        perf_needs_settle_sleep=1
+    fi
+    if [[ "$perf_needs_settle_sleep" -eq 1 ]]; then
         sleep "$(awk "BEGIN { printf \"%.3f\", ${perf_attach_settle_ms}/1000 }")"
     fi
     : >"$profiler_continue_file"
@@ -250,6 +289,17 @@ run_once() {
             if [[ "$timeout_triggered" -eq 0 && "$(date +%s%3N)" -ge "$timeout_deadline_ms" ]]; then
                 timeout_triggered=1
                 : >"$timeout_marker"
+                if kill -0 "$perf_record_pid" 2>/dev/null; then
+                    if [[ "$perf_control_mode" == "control" ]]; then
+                        if ! perf_send_control "$perf_ctl_fifo" "$perf_ack_fifo" stop; then
+                            perf_record_forced_stop=1
+                            force_stop_perf_process "$perf_record_pid"
+                        fi
+                    else
+                        perf_record_forced_stop=1
+                        force_stop_perf_process "$perf_record_pid"
+                    fi
+                fi
                 if kill -0 "$child_pid" 2>/dev/null; then
                     kill -TERM "$child_pid" 2>/dev/null || true
                     for _ in $(seq 1 10); do
@@ -272,51 +322,56 @@ run_once() {
     memory_status=$?
     set -e
 
-    if [[ "$perf_control_mode" == "control" ]]; then
-        if [[ "$timeout_triggered" -eq 0 ]] && kill -0 "$perf_record_pid" 2>/dev/null; then
+    if [[ "$timeout_triggered" -eq 0 ]] && kill -0 "$perf_record_pid" 2>/dev/null; then
+        if [[ "$perf_control_mode" == "control" ]]; then
             if ! perf_send_control "$perf_ctl_fifo" "$perf_ack_fifo" stop; then
-                perf_record_forced_stop=1
-                force_stop_perf_process "$perf_record_pid"
-            fi
-        elif [[ "$timeout_triggered" -eq 1 ]] && kill -0 "$perf_record_pid" 2>/dev/null; then
-            for _ in $(seq 1 100); do
-                if ! kill -0 "$perf_record_pid" 2>/dev/null; then
-                    break
+                if ! wait_for_process_exit "$perf_record_pid"; then
+                    printf 'perf did not acknowledge stop and remained alive\n' >&2
+                    perf_record_forced_stop=1
+                    force_stop_perf_process "$perf_record_pid"
                 fi
-                sleep 0.05
-            done
-            if kill -0 "$perf_record_pid" 2>/dev/null; then
-                perf_record_forced_stop=1
-                force_stop_perf_process "$perf_record_pid"
             fi
+        else
+            perf_record_forced_stop=1
+            force_stop_perf_process "$perf_record_pid"
         fi
-    else
+    fi
+    if [[ "$timeout_triggered" -eq 1 ]] && kill -0 "$perf_record_pid" 2>/dev/null; then
+        for _ in $(seq 1 100); do
+            if ! kill -0 "$perf_record_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+        done
         if kill -0 "$perf_record_pid" 2>/dev/null; then
             perf_record_forced_stop=1
             force_stop_perf_process "$perf_record_pid"
         fi
     fi
+    if [[ "$perf_stat_pid" -ne 0 ]] && [[ "$timeout_triggered" -eq 1 ]] && kill -0 "$perf_stat_pid" 2>/dev/null; then
+        for _ in $(seq 1 100); do
+            if ! kill -0 "$perf_stat_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+        done
+        if kill -0 "$perf_stat_pid" 2>/dev/null; then
+            perf_stat_forced_stop=1
+            force_stop_perf_process "$perf_stat_pid"
+        fi
+    fi
     set +e
     wait "$perf_record_pid"
     perf_record_status=$?
+    if [[ "$perf_stat_pid" -ne 0 ]]; then
+        wait "$perf_stat_pid"
+        perf_stat_status=$?
+    fi
     set -e
     rm -f "$perf_ctl_fifo" "$perf_ack_fifo"
 
     if [[ -f "$perf_data" ]]; then
         perf report --stdio -i "$perf_data" >"$perf_report"
-    fi
-
-    if [[ "$with_perf_stat" -eq 1 ]]; then
-        printf 'running perf stat\n' >&2
-        set +e
-        if [[ -n "$timeout_seconds" ]]; then
-            timeout --signal=INT --kill-after=1 "${timeout_seconds}s" \
-                perf stat -o "$perf_stat" -- "$@"
-        else
-            perf stat -o "$perf_stat" -- "$@"
-        fi
-        perf_stat_status=$?
-        set -e
     fi
 
     memory_status_for_return="$memory_status"
@@ -328,7 +383,7 @@ run_once() {
         perf_record_status_for_return=0
     fi
     perf_stat_status_for_return="$perf_stat_status"
-    if [[ -n "$timeout_seconds" && "$perf_stat_status" -eq 124 ]]; then
+    if [[ -n "$timeout_seconds" && "$perf_stat_forced_stop" -eq 1 ]]; then
         perf_stat_status_for_return=0
     fi
 
@@ -341,6 +396,7 @@ run_once() {
         printf 'perf_record_forced_stop=%s\n' "$perf_record_forced_stop"
         printf 'perf_control_mode=%s\n' "$perf_control_mode"
         printf 'perf_stat_status=%s\n' "$perf_stat_status"
+        printf 'perf_stat_forced_stop=%s\n' "$perf_stat_forced_stop"
         printf 'objects_processed=%s\n' "${objects_processed:-none}"
         printf 'child_pid=%s\n' "$child_pid"
         printf 'combined_log=%s\n' "$combined_log"

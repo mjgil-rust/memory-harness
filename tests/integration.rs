@@ -95,7 +95,7 @@ fn wrapper_repeat_and_perf_stat_create_artifacts() {
         .env("MEMORY_HARNESS_BIN", memory_harness_bin())
         .args(["--perf-stat", "--repeat", "2", "--out-dir"])
         .arg(temp.path())
-        .args(["--", "/usr/bin/env", "true"])
+        .args(["--", "/bin/sh", "-c", "sleep 1"])
         .output()
         .expect("run wrapper");
 
@@ -110,6 +110,59 @@ fn wrapper_repeat_and_perf_stat_create_artifacts() {
         assert!(run_dir.join("summary.txt").is_file(), "{run_dir:?}");
         assert!(run_dir.join("sync/child.pid").is_file(), "{run_dir:?}");
     }
+}
+
+#[test]
+fn wrapper_perf_stat_attaches_to_single_run() {
+    if !perf_available() {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let wrapper = repo_root().join("scripts/run-with-memory-and-perf.sh");
+    let marker = temp.path().join("marker.txt");
+    let run_dir = temp.path().join("run");
+    let command = format!(
+        "printf x >> {}; sleep 1",
+        shell_single_quote(&marker.display().to_string())
+    );
+    let output = Command::new(&wrapper)
+        .env("MEMORY_HARNESS_BIN", memory_harness_bin())
+        .args(["--perf-stat", "--out-dir"])
+        .arg(&run_dir)
+        .args(["--", "/bin/sh", "-c"])
+        .arg(&command)
+        .output()
+        .expect("run wrapper with perf stat");
+
+    assert!(output.status.success(), "status was {:?}", output.status);
+    let marker_contents = std::fs::read_to_string(&marker).expect("read marker");
+    assert_eq!(marker_contents, "x", "{marker_contents:?}");
+    assert!(run_dir.join("perf.stat.txt").is_file(), "{run_dir:?}");
+}
+
+#[test]
+fn wrapper_profiler_handshake_covers_short_lived_commands() {
+    if !perf_available() {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let wrapper = repo_root().join("scripts/run-with-memory-and-perf.sh");
+    let run_dir = temp.path().join("run");
+    let output = Command::new(&wrapper)
+        .env("MEMORY_HARNESS_BIN", memory_harness_bin())
+        .args(["--out-dir"])
+        .arg(&run_dir)
+        .args(["--", "/usr/bin/env", "true"])
+        .output()
+        .expect("run wrapper with short command");
+
+    assert!(output.status.success(), "status was {:?}", output.status);
+    let summary = std::fs::read_to_string(run_dir.join("summary.txt")).expect("read summary");
+    assert!(summary.contains("memory_status=0"), "{summary}");
+    assert!(summary.contains("perf_record_status=0"), "{summary}");
+    assert!(run_dir.join("perf.data").is_file(), "{run_dir:?}");
 }
 
 #[test]
@@ -158,4 +211,8 @@ fn perf_available() -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
